@@ -96,7 +96,8 @@ type temporalMetadata struct {
 	TaskQueue                   string   `keda:"name=taskQueue,                 order=triggerMetadata;resolvedEnv"`
 	QueueTypes                  []string `keda:"name=queueTypes,                order=triggerMetadata, optional"`
 	BuildID                     string   `keda:"name=buildId,                   order=triggerMetadata;resolvedEnv, optional"`
-	WorkerDeployment            string   `keda:"name=workerDeployment,          order=triggerMetadata;resolvedEnv, optional"`
+	WorkerDeploymentName        string   `keda:"name=workerDeploymentName,      order=triggerMetadata;resolvedEnv, optional"`
+	WorkerDeploymentBuildID     string   `keda:"name=workerDeploymentBuildId,   order=triggerMetadata;resolvedEnv, optional"`
 	AllActive                   bool     `keda:"name=selectAllActive,           order=triggerMetadata, default=false"`
 	Unversioned                 bool     `keda:"name=selectUnversioned,         order=triggerMetadata, default=false"`
 	IncludeRunningWorkflowCount bool     `keda:"name=includeRunningWorkflowCount, order=triggerMetadata, default=true"`
@@ -283,32 +284,34 @@ func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable, gateS
 //
 // Three modes, in priority order:
 //
-//   1. workerDeployment + buildID set (RECOMMENDED, for Temporal's worker-
-//      deployment-versioning model): use the canonical, single-valued
+//   1. workerDeploymentName + workerDeploymentBuildID set (RECOMMENDED, for
+//      Temporal's worker-deployment-versioning model): use the canonical,
+//      single-valued
 //      `TemporalWorkerDeploymentVersion = '<deployment-name>:<buildId>'`
 //      search attribute. Set automatically by Temporal as the current routing
 //      assignment regardless of versioning behavior (Pinned/AutoUpgrade).
-//      Empirically verified against Temporal v1.x via direct visibility
-//      queries on workflows pinned to specific worker-deployment versions.
+//      Field names match upstream KEDA v2.20.1's metadata schema so this
+//      branch can switch to upstream without callers re-emitting metadata.
 //
-//   2. buildID set, workerDeployment empty (LEGACY, for older worker-versioning-
-//      rules model): falls back to `BuildIds = 'versioned:<buildId>'`. Doesn't
-//      match workflows pinned via worker-deployment versioning (the assignment
-//      marker for those is `pinned:<dep>:<buildId>`, not `versioned:<buildId>`).
-//      Kept for backward compatibility with deployments still on the older
-//      versioning model.
+//   2. buildID set, workerDeploymentName empty (LEGACY, for older
+//      worker-versioning-rules model): falls back to
+//      `BuildIds = 'versioned:<buildId>'`. Doesn't match workflows pinned
+//      via worker-deployment versioning (the assignment marker for those is
+//      `pinned:<dep>:<buildId>`, not `versioned:<buildId>`). Kept for
+//      backward compatibility with deployments still on the older versioning
+//      model.
 //
 //   3. Neither set: task-queue-wide count, no version scoping.
-func buildRunningCountQuery(taskQueue, workerDeployment, buildID string) string {
+func buildRunningCountQuery(taskQueue, workerDeploymentName, workerDeploymentBuildID, buildID string) string {
 	escapedTQ := strings.ReplaceAll(taskQueue, "'", "''")
 	query := fmt.Sprintf("ExecutionStatus = 'Running' AND TaskQueue = '%s'", escapedTQ)
 	switch {
-	case workerDeployment != "" && buildID != "":
+	case workerDeploymentName != "" && workerDeploymentBuildID != "":
 		// Canonical worker-deployment-versioning query. Uses the single-valued
 		// TemporalWorkerDeploymentVersion attribute set automatically by
 		// Temporal — uniform across Pinned + AutoUpgrade behaviors.
-		escapedDep := strings.ReplaceAll(workerDeployment, "'", "''")
-		escapedBID := strings.ReplaceAll(buildID, "'", "''")
+		escapedDep := strings.ReplaceAll(workerDeploymentName, "'", "''")
+		escapedBID := strings.ReplaceAll(workerDeploymentBuildID, "'", "''")
 		query = fmt.Sprintf("%s AND TemporalWorkerDeploymentVersion = '%s:%s'",
 			query, escapedDep, escapedBID)
 	case buildID != "":
@@ -327,7 +330,7 @@ func (s *temporalScaler) getRunningWorkflowCount(ctx context.Context) (int64, er
 	if taskQueue == "" {
 		taskQueue = s.metadata.TaskQueue
 	}
-	query := buildRunningCountQuery(taskQueue, s.metadata.WorkerDeployment, s.metadata.BuildID)
+	query := buildRunningCountQuery(taskQueue, s.metadata.WorkerDeploymentName, s.metadata.WorkerDeploymentBuildID, s.metadata.BuildID)
 
 	req := &workflowservice.CountWorkflowExecutionsRequest{
 		Namespace: s.metadata.Namespace,

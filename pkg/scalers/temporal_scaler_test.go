@@ -9,6 +9,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -76,6 +78,16 @@ var testTemporalMetadata = []parseTemporalMetadataTestData{
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "includeRunningWorkflowCount": "true", "workflowTaskQueueForCount": "wf-queue"}, false},
 	// includeRunningWorkflowCount rejects unsafe characters in taskQueue
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": "bad queue' OR '1'='1", "namespace": temporalNamespace, "includeRunningWorkflowCount": "true"}, true},
+	// workerCapacityServerAddress without includeWorkerCapacity
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerCapacityServerAddress": "http://prom:9090"}, true},
+	// workerCapacityQuery without includeWorkerCapacity
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerCapacityQuery": "sum(temporal_worker_task_slots_used)"}, true},
+	// includeWorkerCapacity without workerCapacityServerAddress/workerCapacityQuery
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "includeWorkerCapacity": "true"}, true},
+	// includeWorkerCapacity with only workerCapacityServerAddress set
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "includeWorkerCapacity": "true", "workerCapacityServerAddress": "http://prom:9090"}, true},
+	// includeWorkerCapacity + workerCapacityServerAddress + workerCapacityQuery is valid
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "includeWorkerCapacity": "true", "workerCapacityServerAddress": "http://prom:9090", "workerCapacityQuery": "sum(temporal_worker_task_slots_used)"}, false},
 }
 
 var temporalMetricIdentifiers = []temporalMetricIdentifier{
@@ -657,6 +669,119 @@ func TestBuildTemporalTLSConfig(t *testing.T) {
 		assert.NotNil(t, tlsCfg)
 		assert.NotEmpty(t, tlsCfg.Certificates, "client certificate must be present in TLS config")
 	})
+}
+
+func TestIsActiveWithoutBacklogWorkerCapacitySignal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1700000000,"3"]}]}}`))
+	}))
+	defer server.Close()
+
+	s := &temporalScaler{
+		metadata: &temporalMetadata{
+			TaskQueue:                   "orders",
+			IncludeWorkerCapacity:       true,
+			WorkerCapacityServerAddress: server.URL,
+			WorkerCapacityQuery:         "sum(temporal_worker_task_slots_used)",
+		},
+		httpClient: http.DefaultClient,
+		logger:     logger,
+	}
+
+	// No deployment-version status (hasStatus=false) means we always fall through to the
+	// opted-in signals; includeRunningWorkflowCount is off so only worker capacity is checked.
+	got := s.isActiveWithoutBacklog(context.Background(), false, enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_UNSPECIFIED)
+	assert.True(t, got)
+}
+
+func TestGetWorkerCapacity(t *testing.T) {
+	cases := []struct {
+		name           string
+		responseStatus int
+		responseBody   string
+		want           float64
+		wantErr        bool
+	}{
+		{
+			name:           "single series",
+			responseStatus: http.StatusOK,
+			responseBody:   `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1700000000,"4"]}]}}`,
+			want:           4,
+		},
+		{
+			name:           "no series returns zero",
+			responseStatus: http.StatusOK,
+			responseBody:   `{"status":"success","data":{"resultType":"vector","result":[]}}`,
+			want:           0,
+		},
+		{
+			name:           "multiple series is rejected",
+			responseStatus: http.StatusOK,
+			responseBody:   `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1700000000,"1"]},{"metric":{},"value":[1700000000,"2"]}]}}`,
+			wantErr:        true,
+		},
+		{
+			name:           "non-2xx status is an error",
+			responseStatus: http.StatusInternalServerError,
+			responseBody:   `{"status":"error"}`,
+			wantErr:        true,
+		},
+		{
+			name:           "unparseable value is an error",
+			responseStatus: http.StatusOK,
+			responseBody:   `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1700000000,"not-a-number"]}]}}`,
+			wantErr:        true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.responseStatus)
+				_, _ = w.Write([]byte(tc.responseBody))
+			}))
+			defer server.Close()
+
+			s := &temporalScaler{
+				metadata: &temporalMetadata{
+					WorkerCapacityServerAddress: server.URL,
+					WorkerCapacityQuery:         "sum(temporal_worker_task_slots_used)",
+				},
+				httpClient: http.DefaultClient,
+			}
+
+			got, err := s.getWorkerCapacity(context.Background())
+			if tc.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestGetWorkerCapacityAuthAndHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer secret-token", r.Header.Get("Authorization"))
+		assert.Equal(t, "tenant-a", r.Header.Get("X-Scope-OrgID"))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+	}))
+	defer server.Close()
+
+	s := &temporalScaler{
+		metadata: &temporalMetadata{
+			WorkerCapacityServerAddress: server.URL,
+			WorkerCapacityQuery:         "sum(temporal_worker_task_slots_used)",
+			WorkerCapacityBearerToken:   "secret-token",
+			WorkerCapacityHeaders:       map[string]string{"X-Scope-OrgID": "tenant-a"},
+		},
+		httpClient: http.DefaultClient,
+	}
+
+	_, err := s.getWorkerCapacity(context.Background())
+	assert.NoError(t, err)
 }
 
 func TestAuthType(t *testing.T) {

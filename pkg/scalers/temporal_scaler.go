@@ -3,9 +3,14 @@ package scalers
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -51,6 +56,7 @@ type temporalScaler struct {
 	metricType v2.MetricTargetType
 	metadata   *temporalMetadata
 	tcl        sdk.Client
+	httpClient *http.Client
 	logger     logr.Logger
 }
 
@@ -73,9 +79,23 @@ type temporalMetadata struct {
 	// at the workflow task queue whose in-flight workflows should keep the activity workers alive.
 	IncludeRunningWorkflowCount bool   `keda:"name=includeRunningWorkflowCount, order=triggerMetadata, default=false"`
 	WorkflowTaskQueueForCount   string `keda:"name=workflowTaskQueueForCount,   order=triggerMetadata;resolvedEnv, optional"`
-	APIKey                      string `keda:"name=apiKey,                    order=authParams;resolvedEnv, optional"`
-	MinConnectTimeout           int    `keda:"name=minConnectTimeout,         order=triggerMetadata, default=5"`
-	EnableTLS                   bool   `keda:"name=enableTLS,                 order=triggerMetadata, default=true"`
+	// IncludeWorkerCapacity, when true, additionally queries an external metrics source (e.g.
+	// Prometheus, Thanos, or Mimir, typically scraping the Temporal SDK's own worker metrics) for
+	// worker-reported capacity in use, and treats a nonzero result as "busy" for the same
+	// isActive gate used by IncludeRunningWorkflowCount. This catches load that a running
+	// workflow count alone under-counts, e.g. a single workflow driving many concurrent activity
+	// executions against a fixed worker slot pool. Like IncludeRunningWorkflowCount, it only ever
+	// affects isActive, never the reported metric value. Defaults to false to preserve prior
+	// behavior; the scaler has no opinion on how a user's worker metrics are labeled or scraped.
+	IncludeWorkerCapacity       bool              `keda:"name=includeWorkerCapacity,       order=triggerMetadata, default=false"`
+	WorkerCapacityServerAddress string            `keda:"name=workerCapacityServerAddress, order=triggerMetadata;resolvedEnv, optional"`
+	WorkerCapacityQuery         string            `keda:"name=workerCapacityQuery,         order=triggerMetadata;resolvedEnv, optional"`
+	WorkerCapacityHeaders       map[string]string `keda:"name=workerCapacityHeaders,       order=triggerMetadata, optional"`
+	WorkerCapacityBearerToken   string            `keda:"name=workerCapacityBearerToken,   order=authParams;resolvedEnv, optional"`
+	WorkerCapacityUnsafeSSL     bool              `keda:"name=workerCapacityUnsafeSsl,     order=triggerMetadata, default=false"`
+	APIKey                      string            `keda:"name=apiKey,                    order=authParams;resolvedEnv, optional"`
+	MinConnectTimeout           int               `keda:"name=minConnectTimeout,         order=triggerMetadata, default=5"`
+	EnableTLS                   bool              `keda:"name=enableTLS,                 order=triggerMetadata, default=true"`
 
 	UnsafeSsl     bool   `keda:"name=unsafeSsl,                 order=triggerMetadata, optional"`
 	Cert          string `keda:"name=cert,                      order=authParams, optional"`
@@ -121,6 +141,13 @@ func (a *temporalMetadata) Validate() error {
 		}
 	}
 
+	if (a.WorkerCapacityServerAddress != "" || a.WorkerCapacityQuery != "") && !a.IncludeWorkerCapacity {
+		return fmt.Errorf("workerCapacityServerAddress/workerCapacityQuery have no effect unless includeWorkerCapacity is true")
+	}
+	if a.IncludeWorkerCapacity && (a.WorkerCapacityServerAddress == "" || a.WorkerCapacityQuery == "") {
+		return fmt.Errorf("workerCapacityServerAddress and workerCapacityQuery must both be set when includeWorkerCapacity is true")
+	}
+
 	return nil
 }
 
@@ -164,12 +191,16 @@ func NewTemporalScaler(ctx context.Context, config *scalersconfig.ScalerConfig) 
 	if len(meta.QueueTypes) > 0 {
 		kv = append(kv, "queueTypes", meta.QueueTypes)
 	}
+	if meta.IncludeWorkerCapacity {
+		kv = append(kv, "includeWorkerCapacity", true, "workerCapacityServerAddress", meta.WorkerCapacityServerAddress)
+	}
 	logger.Info("Temporal scaler initialized", kv...)
 
 	return &temporalScaler{
 		metricType: metricType,
 		metadata:   meta,
 		tcl:        c,
+		httpClient: kedautil.CreateHTTPClient(config.GlobalHTTPTimeout, meta.WorkerCapacityUnsafeSSL),
 		logger:     logger,
 	}, nil
 }
@@ -178,6 +209,9 @@ func (s *temporalScaler) Close(_ context.Context) error {
 	s.logger.V(1).Info("closing Temporal scaler")
 	if s.tcl != nil {
 		s.tcl.Close()
+	}
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
 	}
 	return nil
 }
@@ -231,7 +265,7 @@ func (s *temporalScaler) GetMetricsAndActivity(ctx context.Context, metricName s
 
 	metric := GenerateMetricInMili(metricName, float64(backlogCount))
 	isActive := backlogCount > s.metadata.ActivationTargetQueueSize
-	if !isActive && s.metadata.IncludeRunningWorkflowCount {
+	if !isActive && (s.metadata.IncludeRunningWorkflowCount || s.metadata.IncludeWorkerCapacity) {
 		isActive = s.isActiveWithoutBacklog(ctx, hasStatus, versionStatus)
 	}
 
@@ -252,25 +286,30 @@ func (s *temporalScaler) GetMetricsAndActivity(ctx context.Context, metricName s
 
 // isActiveWithoutBacklog decides whether the scaler should remain active when the
 // backlog is at or below the activation threshold. It is only invoked when the user
-// has opted in via includeRunningWorkflowCount.
+// has opted in via includeRunningWorkflowCount and/or includeWorkerCapacity.
 //
 // For deployment-version scalers the Worker Deployment Version status short-circuits:
 //   - DRAINING versions are kept active because Temporal keeps replaying workflows
 //     pinned to that version until they complete, and the server checks completion
 //     periodically (roughly every 3 minutes); polling visibility here would just
 //     duplicate that signal at the risk of a false negative during eventual consistency.
-//   - CURRENT / RAMPING versions fall through to a visibility count; new work can
-//     land on these versions, so the running-count check is the only signal available.
+//   - CURRENT / RAMPING versions fall through to the signals below; new work can
+//     land on these versions, so those checks are the only signals available.
 //   - DRAINED / INACTIVE / UNSPECIFIED versions are safe to scale down.
 //
-// For every other mode (build-id, unversioned) we always fall through to the
-// visibility count.
+// For every other mode (build-id, unversioned) we always fall through to the signals below.
 //
-// Callers should be aware that this signal is approximate: it does not cover
-// activity-only workers, visibility indexing has no SLA (eventual consistency is
-// typically a few seconds but has no upper bound), CountWorkflow itself is
-// documented as approximate, and the Temporal frontend rate-limits all visibility
-// calls to roughly 10 RPS per namespace per instance.
+// Each opted-in signal is checked independently and ORed together: either one reporting
+// "busy" is enough to stay active. This lets includeWorkerCapacity catch load that
+// includeRunningWorkflowCount alone would miss, e.g. a single running workflow driving many
+// concurrent activity executions against a fixed worker slot pool (a running-workflow count
+// of one gives no visibility into that fan-out).
+//
+// Callers should be aware that both signals are approximate: visibility indexing has no
+// SLA (eventual consistency is typically a few seconds but has no upper bound), CountWorkflow
+// itself is documented as approximate, the Temporal frontend rate-limits all visibility calls
+// to roughly 10 RPS per namespace per instance, and worker capacity depends entirely on the
+// freshness and correctness of whatever metrics source the user points workerCapacityQuery at.
 func (s *temporalScaler) isActiveWithoutBacklog(ctx context.Context, hasStatus bool, versionStatus enumspb.WorkerDeploymentVersionStatus) bool {
 	if hasStatus {
 		switch versionStatus {
@@ -278,20 +317,35 @@ func (s *temporalScaler) isActiveWithoutBacklog(ctx context.Context, hasStatus b
 			return true
 		case enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_CURRENT,
 			enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_RAMPING:
-			// fall through to the visibility count
+			// fall through to the signals below
 		default:
 			return false
 		}
 	}
 
-	runningCount, err := s.getRunningWorkflowCount(ctx)
-	if err != nil {
-		s.logger.V(1).Info("failed to get running workflow count, treating as no-signal",
-			"mode", scalerMode(s.metadata),
-			"error", err)
-		return false
+	if s.metadata.IncludeRunningWorkflowCount {
+		runningCount, err := s.getRunningWorkflowCount(ctx)
+		if err != nil {
+			s.logger.V(1).Info("failed to get running workflow count, treating as no-signal",
+				"mode", scalerMode(s.metadata),
+				"error", err)
+		} else if runningCount > 0 {
+			return true
+		}
 	}
-	return runningCount > 0
+
+	if s.metadata.IncludeWorkerCapacity {
+		capacity, err := s.getWorkerCapacity(ctx)
+		if err != nil {
+			s.logger.V(1).Info("failed to get worker capacity, treating as no-signal",
+				"mode", scalerMode(s.metadata),
+				"error", err)
+		} else if capacity > 0 {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (s *temporalScaler) getBuildIDBacklogCount(ctx context.Context) (int64, error) {
@@ -417,6 +471,82 @@ func (s *temporalScaler) runningWorkflowCountQuery() (string, error) {
 		query += " AND TemporalWorkerDeploymentVersion is null"
 	}
 	return query, nil
+}
+
+// getWorkerCapacity queries an external metrics source (typically Prometheus, Thanos, or Mimir,
+// scraping the Temporal SDK's own worker metrics) for worker-reported capacity in use. It is
+// only called when includeWorkerCapacity is enabled and the backlog signal alone says "scale to
+// zero" — its role, like getRunningWorkflowCount, is to block premature scale-down.
+//
+// Unlike getRunningWorkflowCount, this can detect load from a single workflow driving many
+// concurrent activities against a fixed worker slot pool, which a running-workflow count of one
+// would otherwise hide. workerCapacityQuery must resolve to a single instant-vector series, e.g.
+// sum(temporal_worker_task_slots_used{namespace="prod", task_queue="orders"}). This scaler has
+// no opinion on how a user's worker metrics are labeled, aggregated, or scraped — that is left
+// entirely to workerCapacityServerAddress/workerCapacityQuery and whatever monitoring stack the
+// user already runs.
+func (s *temporalScaler) getWorkerCapacity(ctx context.Context) (float64, error) {
+	queryURL := fmt.Sprintf("%s/api/v1/query?query=%s&time=%s",
+		s.metadata.WorkerCapacityServerAddress,
+		url.QueryEscape(s.metadata.WorkerCapacityQuery),
+		time.Now().UTC().Format(time.RFC3339))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, queryURL, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to build worker capacity query request: %w", err)
+	}
+	for name, value := range s.metadata.WorkerCapacityHeaders {
+		req.Header.Add(name, value)
+	}
+	if s.metadata.WorkerCapacityBearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+s.metadata.WorkerCapacityBearerToken)
+	}
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query worker capacity endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return 0, fmt.Errorf("worker capacity query api returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read worker capacity response: %w", err)
+	}
+
+	// promQueryResult is defined in prometheus_scaler.go; the Prometheus HTTP query API response
+	// shape is the same regardless of which scaler is asking.
+	var result promQueryResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, fmt.Errorf("failed to parse worker capacity response: %w", err)
+	}
+
+	switch len(result.Data.Result) {
+	case 0:
+		return 0, nil
+	case 1:
+		// continue below
+	default:
+		return 0, fmt.Errorf("worker capacity query %q returned multiple series; wrap it in an aggregation like sum() so it resolves to a single value", s.metadata.WorkerCapacityQuery)
+	}
+
+	values := result.Data.Result[0].Value
+	if len(values) < 2 || values[1] == nil {
+		return 0, nil
+	}
+	str, ok := values[1].(string)
+	if !ok {
+		return 0, fmt.Errorf("unexpected worker capacity value type %T", values[1])
+	}
+	v, err := strconv.ParseFloat(str, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse worker capacity value %q: %w", str, err)
+	}
+	return v, nil
 }
 
 // sumDeploymentBacklog sums ApproximateBacklogCount across the provided task

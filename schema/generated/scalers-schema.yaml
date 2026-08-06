@@ -3995,6 +3995,33 @@ scalers:
           optional: true
           metadataVariableReadable: true
           envVariableReadable: true
+        - name: includeWorkerCapacity
+          type: string
+          default: "false"
+          metadataVariableReadable: true
+        - name: workerCapacityServerAddress
+          type: string
+          optional: true
+          metadataVariableReadable: true
+          envVariableReadable: true
+        - name: workerCapacityQuery
+          type: string
+          optional: true
+          metadataVariableReadable: true
+          envVariableReadable: true
+        - name: workerCapacityHeaders
+          type: string
+          optional: true
+          metadataVariableReadable: true
+        - name: workerCapacityBearerToken
+          type: string
+          optional: true
+          envVariableReadable: true
+          triggerAuthenticationVariableReadable: true
+        - name: workerCapacityUnsafeSsl
+          type: string
+          default: "false"
+          metadataVariableReadable: true
         - name: apiKey
           type: string
           optional: true
